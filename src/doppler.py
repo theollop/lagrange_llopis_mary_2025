@@ -125,11 +125,12 @@ def linear_interpolate_spec(
 
     m_sel = m_pad[idx]
     b_sel = b_pad[idx]
+
     return m_sel * x_new + b_sel
 
 
 # -----------------------------------------------------------------------------
-# Décalage Doppler et calcul de la CCF
+# Décalage Doppler pour un spectre modèle sur plusieurs vitesses
 # -----------------------------------------------------------------------------
 def shift_spec(
     spec: np.ndarray,
@@ -156,7 +157,7 @@ def shift_spec(
     wave_t = torch.as_tensor(wavegrid, dtype=dtype, device=device)
 
     gamma_t = gamma_torch(torch.as_tensor(velocities, dtype=dtype, device=device))
-    wave_shift = wave_t.unsqueeze(0) * gamma_t.unsqueeze(1)
+    wave_shift = wave_t.unsqueeze(0) / gamma_t.unsqueeze(1)
 
     return linear_interpolate_spec(x_ref=wave_t, y_ref=spec_t, x_new=wave_shift)
 
@@ -183,9 +184,16 @@ def get_max_nv(
     # Modèle mémoire : wave_shift & output, idx, m_sel+b_sel, overhead
     if dtype == torch.float64:
         nv = (free_memory_bytes - 56 * L + 8) / (8 + 36 * L)
+
     elif dtype == torch.float32:
         nv = (free_memory_bytes - 28 * L + 4) / (4 + 28 * L)
+
+    elif dtype == torch.float16:
+        nv = (free_memory_bytes - 14 * L + 2) / (2 + 20 * L)
+
     else:
-        raise ValueError("dtype doit être torch.float32 ou torch.float64")
+        raise ValueError(
+            "dtype doit être torch.float32 ou torch.float64 ou torch.float16"
+        )
 
     return floor(nv)

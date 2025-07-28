@@ -1,62 +1,17 @@
+from tempfile import template
 import numpy as np
 import matplotlib.pyplot as plt
 from numba import njit, prange
-from scipy.sparse import coo_matrix
+from scipy.sparse import coo_matrix, csr_matrix
 import time
-from io_spec import get_G2_mask, get_specs_from_h5
+from io_spec import get_mask, get_rvdatachallenge_dataset
 from doppler import _gamma_numba, extend_wavegrid_numba
 import torch
 from cuda import get_free_memory
 from doppler import shift_spec, get_max_nv
 
-# * On va maintenant construire les masques CCF pour toutes les vitesses de la grille.
-# * Ce tableau possède à la fin une taille de (len(v_grid), len(wavegrid)),
-# * Sachant que plus de 90 % du tableau est rempli de zéros, il est plus judicieux de le stocker sous forme de matrice creuse
-# * ce qui permet de gagner en mémoire mais complique l'écriture de la fonction.
-# * En gros il nous faut une liste de triplets (i, j, w)
-# *     i est l'index de la vitesse dans v_grid,
-# *     j est l'index de la longueur d'onde dans wavegrid
-# *     w est la valeur du masque CCF.
-# * Le reste vaudra 0
-# * Pour calculer chaque valeur du masque CCF : w, on va utiliser la méthode des pixels fractionnaires.
 
-# * Voici comment on procède :
-
-# * 1) On étend la grille de longueurs d'onde initiale pour tenir compte des décalages Doppler qui sortiraient les positions de raies standardisées
-# *    de la grille de longueurs d'onde. On utilise la fonction extend_wavegrid_numba pour cela.
-
-# * 2) On définit une largeur de fenêtre autour de chaque raie en espace de vitesse, non en longueur d'onde pourquoi ? :
-# * Certaines raies sont plus shiftées que d'autres (bords du spectre) donc il nous faut une fenêtre plus large pour ces raies.
-# * Définir une largeur de fenêtre en espace de vitesse permet de s'assurer que toutes les raies sont prises en compte,
-# * même celles qui sont très décalées par rapport à la grille de longueurs d'onde.
-# * La taille de la fenêtre en espace de vitesse est définie par l'utilisateur
-# * (window_size_velocity) et est appliquée à chaque raie en fonction de sa position.
-# * On utilise la fonction _gamma_numba pour calculer le facteur de Lorentz pour la vitesse de la grille et pour la taille de la fenêtre en espace de vitesse.
-
-# * 3) Pour chaque vitesse de la grille ->
-
-# *   Pour chaque raie dans le masque de raies ->
-
-# *     On calcule la position de la raie dans la grille étendue, en effet, les positions
-# *     des raies ne tombent pas forcément sur les points de la grille étendue.
-
-# *     On calcule la position de début et de fin de la fenêtre pour cette raie.
-# *     On calcule les indices de début et de fin de la fenêtre dans la grille étendue.
-
-# *     On calcule les fractions de pixels des fenêtres autour de chaque raie qui sortent de la grille étendue.
-
-# *     On obtient donc pour les pixels de bords (fractionnaire) un poids : (poids_de_raie) x (% du pixel de la fenêtre qui est dans la grille étendue)
-# *     Pour les pixels entiers, on a donc un poids : (poids_de_raie) x (1)
-
-# * 4) On stocke les valeurs dans une matrice creuse (sparse matrix) pour ne pas perdre de mémoire.
-
-
-# * Ce calcul est assez coûteux en temps de calcul car il implique une double boucle, on a enfait n_raies * n_vitesses itérations.
-
-# * On utilise donc Numba pour accélérer le calcul en compilant la fonction en code machine.
-# * Le problème avec Numba c'est qu'il ne supporte pas les matrices creuses ni les listes dynamiques on doit préallouer la taille de la matrice creuse.
-# * Donc on doit d'abord compter combien on aura de (i, j, w) à stocker dans la matrice creuse.
-# * Pour cela on commence par coder la fonction _count_entries qui va compter le nombre d'entrées dans la matrice creuse.
+# TODO : revoir tout le code concernant les masques, il doit y avoir un problème de calcul car les masque retournés par les méthode sparses non gauss, ont des valeurs supérieurs à 1...
 
 
 @njit(nopython=True, parallel=True)
@@ -245,30 +200,217 @@ def build_CCF_masks_sparse(
     return CCF[:, s:e]
 
 
-def compute_CCF_mask(
+@njit(nopython=True, parallel=True)
+def _count_per_velocity_gauss(
+    line_pos,
+    line_weights,
+    v_grid,
+    wavegrid_ext,
+    window_size_velocity,
+    wavegrid_step,
+    begin_wave,
+):
+    """
+    Compte le nombre d'entrées de la matrice creuse pour chaque vitesse en profil gaussien.
+    On prend un support ±4σ autour de chaque raie.
+    """
+    c = 299792458.0
+    n_v = v_grid.shape[0]
+    counts = np.zeros(n_v, np.int64)
+    for i in prange(n_v):
+        shift = 1.0 + v_grid[i] / c  # approximation non-relativiste
+        total = 0
+        for j in range(line_pos.shape[0]):
+            lam0 = line_pos[j]
+            lam_c = lam0 * shift
+            sigma = lam0 * (window_size_velocity / c)
+            start = lam_c - 4.0 * sigma
+            end = lam_c + 4.0 * sigma
+            idx0 = int(np.searchsorted(wavegrid_ext, start))
+            idx1 = int(np.searchsorted(wavegrid_ext, end))
+            if idx0 < 0:
+                idx0 = 0
+            if idx1 >= wavegrid_ext.shape[0]:
+                idx1 = wavegrid_ext.shape[0] - 1
+            if idx1 >= idx0:
+                total += idx1 - idx0 + 1
+        counts[i] = total
+    return counts
+
+
+@njit(nopython=True, parallel=True)
+def _fill_entries_gauss(
+    line_pos,
+    line_weights,
+    v_grid,
+    wavegrid_ext,
+    window_size_velocity,
+    wavegrid_step,
+    begin_wave,
+    offsets,
+    rows,
+    cols,
+    vals,
+):
+    """
+    Remplit les entrées de la matrice creuse en profil gaussien.
+    Chaque raie contribue selon exp(-0.5*((lambda-lam_c)/sigma)^2).
+    """
+    c = 299792458.0
+    n_v = v_grid.shape[0]
+    for i in prange(n_v):
+        shift = 1.0 + v_grid[i] / c
+        idx_base = offsets[i]
+        idx = idx_base
+        for j in range(line_pos.shape[0]):
+            lam0 = line_pos[j]
+            weight = line_weights[j]
+            lam_c = lam0 * shift
+            sigma = lam0 * (window_size_velocity / c)
+            start = lam_c - 4.0 * sigma
+            end = lam_c + 4.0 * sigma
+            idx0 = int(np.searchsorted(wavegrid_ext, start))
+            idx1 = int(np.searchsorted(wavegrid_ext, end))
+            if idx0 < 0:
+                idx0 = 0
+            if idx1 >= wavegrid_ext.shape[0]:
+                idx1 = wavegrid_ext.shape[0] - 1
+            for k in range(idx0, idx1 + 1):
+                lam = wavegrid_ext[k]
+                x = (lam - lam_c) / sigma
+                val = weight * np.exp(-0.5 * x * x)
+                rows[idx] = i
+                cols[idx] = k
+                vals[idx] = val
+                idx += 1
+
+
+def build_CCF_masks_sparse_gauss(
+    line_pos: np.ndarray,
+    line_weights: np.ndarray,
+    v_grid: np.ndarray,
+    wavegrid: np.ndarray,
+    window_size_velocity: float,
+) -> csr_matrix:
+    """
+    Construit une matrice creuse CSR de masques CCF gaussiens.
+    Args:
+      - line_pos, line_weights: positions et poids des raies
+      - v_grid: grille RV (m/s)
+      - wavegrid: grille de longueurs d'onde (constant step)
+      - window_size_velocity: sigma du profil gaussien en m/s
+    Returns:
+      CSR matrix de dimension (len(v_grid), len(wavegrid))
+    """
+    # extension doppler
+    wavegrid_ext, wave_before, wave_after = extend_wavegrid_numba(wavegrid, v_grid)
+    step = wavegrid[1] - wavegrid[0]
+    begin = wavegrid_ext[0]
+    n_v = v_grid.size
+
+    # compter les entrées
+    counts = _count_per_velocity_gauss(
+        line_pos, line_weights, v_grid, wavegrid_ext, window_size_velocity, step, begin
+    )
+
+    # offsets
+    offsets = np.empty(n_v, np.int64)
+    total = 0
+    for i in range(n_v):
+        offsets[i] = total
+        total += counts[i]
+
+    # allouer triplets
+    rows = np.empty(total, dtype=np.int64)
+    cols = np.empty(total, dtype=np.int64)
+    vals = np.empty(total, dtype=np.float64)
+
+    # remplir
+    _fill_entries_gauss(
+        line_pos,
+        line_weights,
+        v_grid,
+        wavegrid_ext,
+        window_size_velocity,
+        step,
+        begin,
+        offsets,
+        rows,
+        cols,
+        vals,
+    )
+
+    # assembler et recadrer
+    coo = coo_matrix((vals, (rows, cols)), shape=(n_v, wavegrid_ext.size))
+    CCF = coo.tocsr()
+    s = len(wave_before)
+    e = s + len(wavegrid)
+    return CCF[:, s:e]
+
+
+# Exemple d'intégration dans compute_CCFs_mask
+
+
+def compute_CCFs_mask_gauss(
     specs: np.ndarray,
     v_grid: np.ndarray,
     wavegrid: np.ndarray,
     window_size_velocity: float,
+    mask_type: str = "gauss",
+    custom_mask: np.ndarray = None,
+    verbose: bool = False,
+):
+    # charger masque
+    mask = custom_mask if custom_mask is not None else get_mask(mask_type)
+    line_pos = mask[:, 0]
+    line_weights = mask[:, 1]
+    if verbose:
+        print("Construction CCF gaussian sparse...")
+    CCF_masks = build_CCF_masks_sparse_gauss(
+        line_pos, line_weights, v_grid, wavegrid, window_size_velocity
+    )
+    # calcul CCFs
+    CCFs = (CCF_masks.dot((specs - 1.0).T)).T
+    CCFs -= np.min(CCFs, axis=1, keepdims=True)
+    return CCFs
+
+
+def compute_CCFs_mask(
+    specs: np.ndarray,
+    v_grid: np.ndarray,
+    wavegrid: np.ndarray,
+    window_size_velocity: float,
+    mask_type: str = "G2",
+    custom_mask_path: str = None,
+    verbose: bool = False,
 ):
     """
     Fonction de haut niveau pour construire les masques CCF.
     Args:
-        line_pos (np.ndarray): Positions des raies dans la grille de longueurs d'onde.
-        line_weights (np.ndarray): Poids des raies.
+        specs (np.ndarray): Spectres à analyser
         v_grid (np.ndarray): Grille de vitesses pour laquelle on construit les masques CCF.
         wavegrid (np.ndarray): Grille de longueurs d'onde DE PAS CONSTANT sur laquelle les spectres sont définis.
         window_size_velocity (float): Taille de la fenêtre en espace de vitesse.
+        mask_type (str): Type de masque à utiliser ("G2", "HARPN_Kitcat", "ESPRESSO_F9", "custom")
+        custom_mask_path (str): Chemin vers un masque personnalisé (si mask_type="custom")
+        verbose (bool): Affichage détaillé
     Returns:
-        CCF_masks (csr_matrix): Matrice creuse contenant les masques CCF pour chaque vitesse de la grille.
+        CCFs (np.ndarray): CCFs calculées pour tous les spectres
     """
+    if verbose:
+        print(f"Chargement du masque de raies ({mask_type})...")
 
-    print("Chargement du masque de raies...")
-    mask = get_G2_mask()
+    mask = get_mask(mask_type=mask_type, custom_path=custom_mask_path)
     line_pos = mask[:, 0]
     line_weights = mask[:, 1]
 
-    print("Construction des masques CCF...")
+    if verbose:
+        print(
+            f"Masque chargé: {len(line_pos)} raies, plage {line_pos.min():.1f}-{line_pos.max():.1f} Å"
+        )
+
+    if verbose:
+        print("Construction des masques CCF...")
     start = time.time()
     CCF_masks = build_CCF_masks_sparse(
         line_pos=line_pos,
@@ -278,23 +420,25 @@ def compute_CCF_mask(
         window_size_velocity=window_size_velocity,
     )
     end = time.time()
-    print(f"Temps de calcul pour build_CCF_masks_sparse: {end - start:.2f} secondes")
+    if verbose:
+        print(
+            f"Temps de calcul pour build_CCF_masks_sparse: {end - start:.2f} secondes"
+        )
 
-    print(f"Forme du tableau CCF: {CCF_masks.shape}")
+        print(f"Forme du tableau CCF: {CCF_masks.shape}")
 
-    print("Calcul des CCFs sur la grille")
+        print("Calcul des CCFs sur la grille")
+
     start = time.time()
     tmp = CCF_masks.dot(specs.T)  # shape (n_v, n_specs)
     CCFs = tmp.T  # shape (n_specs, n_v)
     end = time.time()
-    print(f"Temps de calcul pour les CCFs: {end - start:.2f} secondes")
+    if verbose:
+        print(f"Temps de calcul pour les CCFs: {end - start:.2f} secondes")
     return CCFs
 
 
-# -----------------------------------------------------------------------------
-# Exécution principale
-# -----------------------------------------------------------------------------
-def compute_ccf_template(
+def compute_CCFs_template(
     specs: np.ndarray,
     template: np.ndarray,
     wavegrid: np.ndarray,
@@ -326,9 +470,10 @@ def compute_ccf_template(
     CCFs = []
 
     for k, spec in enumerate(specs):
-        print(
-            f"Calcul de la CCF pour le spectre {k + 1}/{len(specs)} avec {len(v_grid)} vitesses"
-        )
+        if verbose:
+            print(
+                f"Calcul de la CCF pour le spectre {k + 1}/{len(specs)} avec {len(v_grid)} vitesses"
+            )
         spec_for_ccf = torch.as_tensor(spec, dtype=dtype, device="cuda")
 
         # Calcul de la mémoire GPU utilisable
@@ -338,7 +483,8 @@ def compute_ccf_template(
 
         # Taille maximale de batch
         nv_max = get_max_nv(L, free_mem, dtype)
-        print(f"Taille max de vitesses par batch : {nv_max}")
+        if verbose:
+            print(f"Taille max de vitesses par batch : {nv_max}")
 
         # Découpage en batches
         batches = [v_grid[i : i + nv_max] for i in range(0, len(v_grid), nv_max)]
@@ -350,16 +496,13 @@ def compute_ccf_template(
             shifted = shift_spec(template, wavegrid, batch, dtype)
             ccf_batch = torch.sum(shifted * spec_for_ccf.unsqueeze(0), dim=1)
             ccf_values.append(ccf_batch.cpu().numpy())
-            if verbose:
-                print(f"Batch traité, taille : {len(batch)}")
             del shifted, ccf_batch
 
         # Concaténation et mesure du temps
         ccf = np.concatenate(ccf_values)
-        # Normalisation de toutes les CCFs
-        ccf /= np.linalg.norm(ccf)
         dt = time.time() - t0
-        print(f"Temps total CCF : {dt:.2f} s pour {len(v_grid)} vitesses")
+        if verbose:
+            print(f"Temps total CCF : {dt:.2f} s pour {len(v_grid)} vitesses")
 
         CCFs.append(ccf)
 
@@ -369,468 +512,268 @@ def compute_ccf_template(
     return CCFs
 
 
-def extract_rv_template(
+def compute_CCFs_template_optimized(
     specs: np.ndarray,
     template: np.ndarray,
     wavegrid: np.ndarray,
     v_grid: np.ndarray,
-    fit_model: str = "gaussian",
-    window_size: float = 2000,
-    poly_order: int = 2,
     dtype: torch.dtype = torch.float32,
     verbose: bool = False,
-    **fit_kwargs,
-) -> dict:
+    batch_size_specs: int = None,
+) -> np.ndarray:
     """
-    Calcule les CCFs par méthode template puis extrait les vitesses radiales par ajustement.
+    Version optimisée : pré-calcule les templates décalés une seule fois,
+    puis traite les spectres par batches avec calculs vectorisés.
 
-    Args:
-        specs: Spectres à analyser (n_specs, n_wave)
-        template: Spectre template de référence (n_wave,)
-        wavegrid: Grille de longueurs d'onde (n_wave,)
-        v_grid: Grille de vitesses pour le calcul CCF (m/s)
-        fit_model: Modèle d'ajustement ('gaussian', 'lorentzian', 'voigt', 'polynomial')
-        window_size: Taille de la fenêtre d'ajustement (m/s)
-        poly_order: Ordre du polynôme (si fit_model='polynomial')
-        dtype: Type PyTorch pour les calculs
-        verbose: Affichage détaillé
-        **fit_kwargs: Arguments supplémentaires pour l'ajustement
-
-    Returns:
-        dict: Dictionnaire contenant les résultats pour chaque spectre
-            - 'rv': vitesses radiales (m/s)
-            - 'rv_errors': erreurs sur les VR (m/s)
-            - 'fit_results': résultats détaillés des ajustements
-            - 'ccfs': CCFs calculées
-            - 'v_grid': grille de vitesses utilisée
-            - 'success': booléens indiquant le succès des ajustements
+    OPTIMISATIONS CLÉS :
+    1. Pré-calcul des templates décalés (évite la recomputation)
+    2. Traitement par batches de spectres
+    3. Utilisation de torch.mm pour les produits matriciels
+    4. Gestion optimale de la mémoire GPU
     """
-    print("=== EXTRACTION VR PAR MÉTHODE TEMPLATE ===")
-    print(f"Nombre de spectres: {len(specs)}")
-    print(f"Modèle d'ajustement: {fit_model}")
-    print(f"Fenêtre d'ajustement: {window_size} m/s")
+    # Libération de la mémoire GPU
+    torch.cuda.empty_cache()
 
-    # Import du fitter
-    try:
-        from fitter import CCFFitter, extract_rv_from_fit
-    except ImportError:
-        raise ImportError(
-            "Module 'fitter' non trouvé. Assurez-vous que fitter.py est dans le même répertoire."
-        )
+    n_specs = specs.shape[0]
+    L = wavegrid.shape[0]
+    n_v = len(v_grid)
 
-    # 1. Calcul des CCFs avec la méthode template
-    print("\n1. Calcul des CCFs...")
-    start_ccf = time.time()
-    CCFs = compute_ccf_template(
-        specs=specs,
-        template=template,
-        wavegrid=wavegrid,
-        v_grid=v_grid,
-        dtype=dtype,
-        verbose=verbose,
+    # Calcul de la mémoire GPU utilisable
+    safety_factor = 0.85
+    free_mem = get_free_memory() * safety_factor
+
+    if verbose:
+        print(f"Mémoire GPU libre : {free_mem / 1e9:.2f} GB")
+        print(f"Traitement de {n_specs} spectres avec {n_v} vitesses")
+
+    # Détermination de la taille de batch pour les vitesses
+    nv_max = get_max_nv(L, free_mem, dtype)
+    if verbose:
+        print(f"Taille max de vitesses par batch : {nv_max}")
+
+    # Détermination de la taille de batch pour les spectres
+    if batch_size_specs is None:
+        # Estimation basée sur la mémoire disponible
+        bytes_per_element = 4 if dtype == torch.float32 else 8
+        memory_per_spec = L * bytes_per_element
+        memory_per_vbatch = nv_max * L * bytes_per_element  # pour les templates décalés
+        remaining_memory = free_mem - memory_per_vbatch
+        batch_size_specs = max(
+            1, int(remaining_memory // memory_per_spec // 2)
+        )  # facteur 2 de sécurité
+
+    batch_size_specs = min(batch_size_specs, n_specs)
+
+    if verbose:
+        print(f"Taille de batch pour les spectres : {batch_size_specs}")
+
+    # Découpage en batches pour les vitesses
+    v_batches = [v_grid[i : i + nv_max] for i in range(0, len(v_grid), nv_max)]
+
+    # Découpage en batches pour les spectres
+    spec_batches = [
+        specs[i : i + batch_size_specs] for i in range(0, n_specs, batch_size_specs)
+    ]
+
+    CCFs = np.zeros(
+        (n_specs, n_v), dtype=np.float32 if dtype == torch.float32 else np.float64
     )
-    end_ccf = time.time()
-    print(f"Temps total CCF template: {end_ccf - start_ccf:.2f} s")
 
-    # 2. Initialisation du fitter
-    fitter = CCFFitter()
+    total_start = time.time()
 
-    # 3. Ajustements sur chaque CCF
-    print(f"\n2. Ajustements {fit_model} sur {len(CCFs)} CCFs...")
-    start_fit = time.time()
-
-    results = {
-        "rv": [],
-        "rv_errors": [],
-        "fit_results": [],
-        "ccfs": CCFs,
-        "v_grid": v_grid,
-        "success": [],
-        "r_squared": [],
-        "method": "template",
-        "fit_model": fit_model,
-    }
-
-    for i, ccf in enumerate(CCFs):
+    # Boucle sur les batches de vitesses
+    for v_idx, v_batch in enumerate(v_batches):
         if verbose:
-            print(f"  Ajustement spectre {i + 1}/{len(CCFs)}")
-
-        try:
-            # Ajustement
-            fit_result = fitter.fit_ccf(
-                ccf=ccf,
-                v_grid=v_grid,
-                model=fit_model,
-                window_size=window_size,
-                poly_order=poly_order,
-                **fit_kwargs,
+            print(
+                f"Traitement du batch de vitesses {v_idx + 1}/{len(v_batches)} ({len(v_batch)} vitesses)"
             )
 
-            if fit_result["success"]:
-                rv, rv_error = extract_rv_from_fit(fit_result)
-                results["rv"].append(rv)
-                results["rv_errors"].append(rv_error)
-                results["r_squared"].append(fit_result["r_squared"])
-                results["success"].append(True)
+        # Pré-calcul des templates décalés pour ce batch de vitesses
+        v_start_time = time.time()
+        shifted_templates = shift_spec(
+            template, wavegrid, v_batch, dtype
+        )  # (nv_batch, L)
+        template_time = time.time() - v_start_time
 
-                if verbose:
-                    print(
-                        f"    VR = {rv:.2f} ± {rv_error:.2f} m/s (R² = {fit_result['r_squared']:.4f})"
-                    )
-            else:
-                results["rv"].append(np.nan)
-                results["rv_errors"].append(np.nan)
-                results["r_squared"].append(np.nan)
-                results["success"].append(False)
+        if verbose:
+            print(f"  Temps de calcul des templates décalés : {template_time:.3f}s")
 
-                if verbose:
-                    print(
-                        f"    Échec ajustement: {fit_result.get('error_message', 'Erreur inconnue')}"
-                    )
+        # Boucle sur les batches de spectres
+        for s_idx, spec_batch in enumerate(spec_batches):
+            if verbose and len(spec_batches) > 1:
+                print(
+                    f"    Batch de spectres {s_idx + 1}/{len(spec_batches)} ({len(spec_batch)} spectres)"
+                )
 
-            results["fit_results"].append(fit_result)
+            # Transfert des spectres vers GPU
+            specs_gpu = torch.as_tensor(
+                spec_batch, dtype=dtype, device="cuda"
+            )  # (n_batch, L)
 
-        except Exception as e:
-            print(f"    Erreur spectre {i + 1}: {e}")
-            results["rv"].append(np.nan)
-            results["rv_errors"].append(np.nan)
-            results["r_squared"].append(np.nan)
-            results["success"].append(False)
-            results["fit_results"].append({"success": False, "error_message": str(e)})
+            # Calcul vectorisé de la CCF: (nv_batch, L) @ (n_batch, L).T = (nv_batch, n_batch)
+            ccf_batch = torch.mm(shifted_templates, specs_gpu.T)  # (nv_batch, n_batch)
 
-    # Conversion en numpy arrays
-    results["rv"] = np.array(results["rv"])
-    results["rv_errors"] = np.array(results["rv_errors"])
-    results["r_squared"] = np.array(results["r_squared"])
-    results["success"] = np.array(results["success"])
+            # Stockage des résultats
+            v_start = v_idx * nv_max
+            v_end = v_start + len(v_batch)
+            s_start = s_idx * batch_size_specs
+            s_end = s_start + len(spec_batch)
 
-    end_fit = time.time()
-    print(f"Temps total ajustements: {end_fit - start_fit:.2f} s")
+            CCFs[s_start:s_end, v_start:v_end] = ccf_batch.T.cpu().numpy()
 
-    # Statistiques
-    n_success = np.sum(results["success"])
-    print("\nRésultats:")
-    print(f"  Ajustements réussis: {n_success}/{len(specs)}")
+            # Nettoyage
+            del specs_gpu, ccf_batch
 
-    if n_success > 0:
-        valid_rvs = results["rv"][results["success"]]
-        valid_errors = results["rv_errors"][results["success"]]
-        valid_r2 = results["r_squared"][results["success"]]
+        # Nettoyage des templates décalés
+        del shifted_templates
+        torch.cuda.empty_cache()
 
-        print(f"  VR moyenne: {np.mean(valid_rvs):.1f} ± {np.std(valid_rvs):.1f} m/s")
-        print(f"  Erreur moyenne: {np.mean(valid_errors):.1f} m/s")
-        print(f"  R² moyen: {np.mean(valid_r2):.4f}")
+    total_time = time.time() - total_start
+    if verbose:
+        print(
+            f"Temps total optimisé : {total_time:.2f}s pour {n_specs} spectres et {n_v} vitesses"
+        )
+        speedup_estimate = (n_specs * n_v * L) / (total_time * 1e9)  # GFLOPS estimate
+        print(f"Performance estimée : {speedup_estimate:.1f} GFLOPS")
 
-    return results
+    return CCFs
 
 
-def extract_rv_masks(
-    specs: np.ndarray,
-    wavegrid: np.ndarray,
-    v_grid: np.ndarray,
-    window_size_velocity: float = 820,
-    fit_model: str = "gaussian",
-    window_size_fit: float = 2000,
-    poly_order: int = 2,
-    verbose: bool = False,
-    **fit_kwargs,
-) -> dict:
+def normalize_CCFs(CCFs: np.ndarray) -> np.ndarray:
     """
-    Calcule les CCFs par méthode masques de raies puis extrait les vitesses radiales par ajustement.
+    Normalise les CCFs en divisant par le max / min de chaque CCF.
 
     Args:
-        specs: Spectres à analyser (n_specs, n_wave)
-        wavegrid: Grille de longueurs d'onde DE PAS CONSTANT (n_wave,)
-        v_grid: Grille de vitesses pour le calcul CCF (m/s)
-        window_size_velocity: Taille fenêtre en espace vitesse pour construction masques (m/s)
-        fit_model: Modèle d'ajustement ('gaussian', 'lorentzian', 'voigt', 'polynomial')
-        window_size_fit: Taille de la fenêtre d'ajustement (m/s)
-        poly_order: Ordre du polynôme (si fit_model='polynomial')
-        verbose: Affichage détaillé
-        **fit_kwargs: Arguments supplémentaires pour l'ajustement
+        CCFs (np.ndarray): Tableau des CCFs à normaliser.
 
     Returns:
-        dict: Dictionnaire contenant les résultats pour chaque spectre
-            - 'rv': vitesses radiales (m/s)
-            - 'rv_errors': erreurs sur les VR (m/s)
-            - 'fit_results': résultats détaillés des ajustements
-            - 'ccfs': CCFs calculées
-            - 'v_grid': grille de vitesses utilisée
-            - 'success': booléens indiquant le succès des ajustements
+        np.ndarray: Tableau des CCFs normalisés.
     """
-    print("=== EXTRACTION VR PAR MÉTHODE MASQUES ===")
-    print(f"Nombre de spectres: {len(specs)}")
-    print(f"Fenêtre vitesse (masques): {window_size_velocity} m/s")
-    print(f"Modèle d'ajustement: {fit_model}")
-    print(f"Fenêtre d'ajustement: {window_size_fit} m/s")
 
-    # Import du fitter
-    try:
-        from fitter import CCFFitter, extract_rv_from_fit
-    except ImportError:
-        raise ImportError(
-            "Module 'fitter' non trouvé. Assurez-vous que fitter.py est dans le même répertoire."
-        )
+    return CCFs / np.max(np.abs(CCFs), axis=1, keepdims=True)
 
-    # 1. Calcul des CCFs avec la méthode masques
-    print("\n1. Calcul des CCFs avec masques de raies...")
-    start_ccf = time.time()
-    CCFs = compute_CCF_mask(
-        specs=specs,
-        v_grid=v_grid,
+
+def compute_CCFs_masked_template(
+    specs: np.ndarray,
+    template: np.ndarray,
+    wavegrid: np.ndarray,
+    v_grid: np.ndarray,
+    mask_type: str = "G2",
+    window_size_velocity: float = 410.0,
+    custom_mask: np.ndarray = None,
+    verbose: bool = False,
+) -> np.ndarray:
+    """
+    Calcule les CCFs en utilisant un masque de raies qui masque un template, puis on shift le template sur la grille de vitesses afin de calculer les CCFs.
+
+    Args:
+        specs (np.ndarray): Spectres à analyser.
+        template (np.ndarray): Template de référence.
+        wavegrid (np.ndarray): Grille de longueurs d'onde.
+        v_grid (np.ndarray): Grille de vitesses.
+        mask_type (str): Type de masque à utiliser ("G2", "HARPN_Kitcat", "ESPRESSO_F9", "custom").
+        window_size_velocity (float): Taille de la fenêtre en espace de vitesse.
+        custom_mask (np.ndarray): Masque personnalisé (si mask_type="custom").
+        verbose (bool): Affichage détaillé.
+
+    Returns:
+        np.ndarray: CCFs calculées pour tous les spectres.
+    """
+    # Première étape, calculer le masque pour sélectionner les raies du template
+    mask = get_mask(mask_type=mask_type)
+    line_pos = mask[:, 0]
+    line_weights = mask[:, 1]
+
+    template_mask = build_CCF_masks_sparse_gauss(
+        line_pos=line_pos,
+        line_weights=line_weights,
+        v_grid=np.array([0]),  # On ne calcule pas pour v_grid ici
         wavegrid=wavegrid,
         window_size_velocity=window_size_velocity,
     )
-    end_ccf = time.time()
-    print(f"Temps total CCF masques: {end_ccf - start_ccf:.2f} s")
+    template_mask /= template_mask.max()  # Normalisation du masque
 
-    # 2. Initialisation du fitter
-    fitter = CCFFitter()
+    masked_template = template_mask.multiply(template)
 
-    # 3. Ajustements sur chaque CCF
-    print(f"\n2. Ajustements {fit_model} sur {len(CCFs)} CCFs...")
-    start_fit = time.time()
+    masked_template = masked_template.toarray()[0]
 
-    results = {
-        "rv": [],
-        "rv_errors": [],
-        "fit_results": [],
-        "ccfs": CCFs,
-        "v_grid": v_grid,
-        "success": [],
-        "r_squared": [],
-        "method": "masks",
-        "fit_model": fit_model,
-        "window_size_velocity": window_size_velocity,
-    }
+    CCFs = compute_CCFs_template_optimized(
+        specs=specs,
+        template=masked_template,
+        wavegrid=wavegrid,
+        v_grid=v_grid,
+        verbose=verbose,
+    )
 
-    for i, ccf in enumerate(CCFs):
-        if verbose:
-            print(f"  Ajustement spectre {i + 1}/{len(CCFs)}")
+    return CCFs
 
-        try:
-            # Ajustement
-            fit_result = fitter.fit_ccf(
-                ccf=ccf,
-                v_grid=v_grid,
-                model=fit_model,
-                window_size=window_size_fit,
-                poly_order=poly_order,
-                **fit_kwargs,
-            )
+    # # Construction du template décalé
+    # shifted_templates = build_shifted_templates(
+    #     template=template,
+    #     v_grid=v_grid,
+    #     line_pos=line_pos,
+    #     line_weights=line_weights,
+    #     window_size_velocity=window_size_velocity,
+    # )
 
-            if fit_result["success"]:
-                rv, rv_error = extract_rv_from_fit(fit_result)
-                results["rv"].append(rv)
-                results["rv_errors"].append(rv_error)
-                results["r_squared"].append(fit_result["r_squared"])
-                results["success"].append(True)
+    # # Calcul des CCFs
+    # CCFs = compute_CCFs(
+    #     specs=specs,
+    #     shifted_templates=shifted_templates,
+    #     wavegrid=wavegrid,
+    #     v_grid=v_grid,
+    #     verbose=verbose,
+    # )
 
-                if verbose:
-                    print(
-                        f"    VR = {rv:.2f} ± {rv_error:.2f} m/s (R² = {fit_result['r_squared']:.4f})"
-                    )
-            else:
-                results["rv"].append(np.nan)
-                results["rv_errors"].append(np.nan)
-                results["r_squared"].append(np.nan)
-                results["success"].append(False)
-
-                if verbose:
-                    print(
-                        f"    Échec ajustement: {fit_result.get('error_message', 'Erreur inconnue')}"
-                    )
-
-            results["fit_results"].append(fit_result)
-
-        except Exception as e:
-            print(f"    Erreur spectre {i + 1}: {e}")
-            results["rv"].append(np.nan)
-            results["rv_errors"].append(np.nan)
-            results["r_squared"].append(np.nan)
-            results["success"].append(False)
-            results["fit_results"].append({"success": False, "error_message": str(e)})
-
-    # Conversion en numpy arrays
-    results["rv"] = np.array(results["rv"])
-    results["rv_errors"] = np.array(results["rv_errors"])
-    results["r_squared"] = np.array(results["r_squared"])
-    results["success"] = np.array(results["success"])
-
-    end_fit = time.time()
-    print(f"Temps total ajustements: {end_fit - start_fit:.2f} s")
-
-    # Statistiques
-    n_success = np.sum(results["success"])
-    print("\nRésultats:")
-    print(f"  Ajustements réussis: {n_success}/{len(specs)}")
-
-    if n_success > 0:
-        valid_rvs = results["rv"][results["success"]]
-        valid_errors = results["rv_errors"][results["success"]]
-        valid_r2 = results["r_squared"][results["success"]]
-
-        print(f"  VR moyenne: {np.mean(valid_rvs):.1f} ± {np.std(valid_rvs):.1f} m/s")
-        print(f"  Erreur moyenne: {np.mean(valid_errors):.1f} m/s")
-        print(f"  R² moyen: {np.mean(valid_r2):.4f}")
-
-    return results
+    # return CCFs
 
 
 # Point d'entrée du script: appel de la fonction compute_ccf et tracé
 if __name__ == "__main__":
-    # Exemple d'utilisation basique
-    print("=== EXEMPLE D'UTILISATION DES FONCTIONS CCF ===")
+    torch.cuda.empty_cache()  # Nettoyage de la mémoire GPU
 
-    # Chargement des données
-    specs, wavegrid = get_specs_from_h5(
-        filepath="/home/tliopis/Codes/lagrange_llopis_mary_2025/data/soapgpu/paper_dataset/spec_cube_tot.h5",
-        idx_spec_start=0,
-        idx_spec_end=5,  # Seulement quelques spectres pour l'exemple
-        wavemin=None,
-        wavemax=None,
+    # Hyperparamètres
+    verbose: bool = True
+    wavemin: float = 4500
+    wavemax: float = 6000
+    n_specs = 1000
+    planetary_signal_amplitudes: list = None
+    planetary_signal_periods: list = None
+    verbose: bool = False
+    noise_level: float = 0
+    v_grid_max: int = 20000
+    v_grid_step: int = 100
+    v_grid: np.ndarray = np.arange(-v_grid_max, v_grid_max, v_grid_step)
+    window_size_velocity: int = 410  # Taille de la fenêtre en espace de vitesse en m/s
+    fit_window_size: int = 10000  # Taille de la fenêtre pour le fit en m/s
+
+    dataset, wavegrid, template, jdb = get_rvdatachallenge_dataset(
+        n_specs=10,
+        wavemin=wavemin,
+        wavemax=wavemax,
+        planetary_signal_amplitudes=None,
+        planetary_signal_periods=None,
+        verbose=verbose,
+        noise_level=0,
     )
 
-    template = specs[0]
-    specs_to_analyze = specs[1:]
+    template = template / template.max()  # Normalisation du template
 
-    v_grid = np.arange(-20000, 20000, 100)  # Grille de vitesses
-
-    print("\n1. Test de la fonction extract_rv_template:")
-    try:
-        results_template = extract_rv_template(
-            specs=specs_to_analyze,
-            template=template,
-            wavegrid=wavegrid,
-            v_grid=v_grid,
-            fit_model="gaussian",
-            window_size=2000,
-            verbose=True,
-        )
-
-        print("\nRésultats méthode template:")
-        for i, (rv, err, success) in enumerate(
-            zip(
-                results_template["rv"],
-                results_template["rv_errors"],
-                results_template["success"],
-            )
-        ):
-            if success:
-                print(f"  Spectre {i + 1}: VR = {rv:.1f} ± {err:.1f} m/s")
-            else:
-                print(f"  Spectre {i + 1}: ÉCHEC")
-
-    except Exception as e:
-        print(f"Erreur méthode template: {e}")
-
-    print("\n2. Test de la fonction extract_rv_masks:")
-    try:
-        results_masks = extract_rv_masks(
-            specs=specs_to_analyze,
-            wavegrid=wavegrid,
-            v_grid=v_grid,
-            window_size_velocity=820,
-            fit_model="gaussian",
-            window_size_fit=2000,
-            verbose=True,
-        )
-
-        print("\nRésultats méthode masques:")
-        for i, (rv, err, success) in enumerate(
-            zip(
-                results_masks["rv"],
-                results_masks["rv_errors"],
-                results_masks["success"],
-            )
-        ):
-            if success:
-                print(f"  Spectre {i + 1}: VR = {rv:.1f} ± {err:.1f} m/s")
-            else:
-                print(f"  Spectre {i + 1}: ÉCHEC")
-
-    except Exception as e:
-        print(f"Erreur méthode masques: {e}")
-
-    # Comparaison des méthodes si les deux ont fonctionné
-    if "results_template" in locals() and "results_masks" in locals():
-        print("\n3. Comparaison des méthodes:")
-        print("Spectre | Template (m/s) | Masques (m/s) | Différence")
-        print("-" * 55)
-
-        for i in range(len(specs_to_analyze)):
-            rv_temp = (
-                results_template["rv"][i] if results_template["success"][i] else np.nan
-            )
-            rv_mask = results_masks["rv"][i] if results_masks["success"][i] else np.nan
-
-            if not (np.isnan(rv_temp) or np.isnan(rv_mask)):
-                diff = rv_temp - rv_mask
-                print(f"{i + 1:7d} | {rv_temp:12.1f} | {rv_mask:11.1f} | {diff:8.1f}")
-            else:
-                print(f"{i + 1:7d} | {'N/A':>12} | {'N/A':>11} | {'N/A':>8}")
-
-    # Tracé simple de la première CCF (ancienne version pour compatibilité)
-    print("\n4. Tracé CCF simple (méthode template):")
-    CCFs = compute_ccf_template(
-        specs=specs[1:2],  # Un seul spectre
+    CCFs = compute_CCFs_masked_template(
+        specs=dataset,
         template=template,
         wavegrid=wavegrid,
         v_grid=v_grid,
-        dtype=torch.float32,
+        mask_type="G2",
+        window_size_velocity=410,
+        verbose=verbose,
     )
 
     plt.figure(figsize=(10, 6))
-    plt.plot(v_grid, CCFs[0])
-    plt.xlabel("Vitesse (m/s)")
-    plt.ylabel("Cross-Correlation Function")
-    plt.title("CCF vs. vitesse radiale")
-    plt.grid(True)
+    plt.plot(v_grid, CCFs[0], label="CCF for first spectrum")
+    plt.xlabel("Velocity (m/s)")
+    plt.ylabel("CCF Value")
+    plt.title("Cross-Correlation Function (CCF)")
+    plt.legend()
+    plt.grid()
     plt.show()
-
-
-# # * On peut maintenant utiliser cette fonction pour construire les masques CCF
-# # * Exemple d'utilisation de la fonction build_CCF_masks_sparse
-# v_grid = np.arange(-20000, 20000, 10)  # Exemple de grille de vitesses
-# window_size_velocity = 820  # Exemple de taille de fenêtre en espace de vitesse
-# start = time.time()
-# CCF_masks = build_CCF_masks_sparse(
-#     line_pos=mask[:, 0],
-#     line_weights=mask[:, 1],
-#     v_grid=v_grid,
-#     wavegrid=wavegrid,
-#     window_size_velocity=window_size_velocity,
-# )
-# end = time.time()
-# print(f"Temps de calcul pour build_CCF_masks_sparse: {end - start:.2f} secondes")
-
-# # Calcul de la mémoire utilisée par les trois tableaux internes
-# data_nbytes = CCF_masks.data.nbytes
-# indices_nbytes = CCF_masks.indices.nbytes
-# indptr_nbytes = CCF_masks.indptr.nbytes
-# total_bytes = data_nbytes + indices_nbytes + indptr_nbytes
-
-
-# specs, wavegrid = get_specs_from_h5(
-#     filepath="../data/soapgpu/paper_dataset/spec_cube_tot.h5",
-#     idx_spec_start=0,
-#     idx_spec_end=99,
-#     wavemin=None,
-#     wavemax=None,
-# )
-# # * On peut maintenant utiliser les masques CCF pour calculer les CCF des spectres
-# print("Calcul des CCF pour les spectres...")
-
-# tmp = CCF_masks.dot(specs.T)  # shape (n_v, n_specs)
-# CCF_spec_vs_v = tmp.T  # shape (n_specs, n_v)
-
-# # Affichage de la forme du tableau CCF
-# print(f"Forme du tableau CCF: {CCF_spec_vs_v.shape}")
-
-# # Affichage des CCF pour les 5 premiers spectres
-# for i in range(5):
-#     plot_ccf(
-#         CCF_spec_vs_v[i],
-#         v_grid,
-#         title=f"CCF pour le spectre {i + 1}",
-#     )
